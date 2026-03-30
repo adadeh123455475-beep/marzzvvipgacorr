@@ -1,0 +1,212 @@
+cat << 'EOF' > /root/index1.js
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+const https = require('https');
+const http = require('http');
+
+// ================= KONFIGURASI =================
+const PANEL_URL = 'https://hanzjembut.pterodactly.biz.id';
+const API_KEY = 'ptla_TwBHgU6DgN4W5HofUaUk6lNLOWTCnGGcOZ6A5BvsqZ2'; // Wajib ganti Key lu!
+const BOT_TOKEN = '8218212845:AAH1CkoJvCCoyUCyQPuzv1FqdraPbmLPH4Y';
+const CHAT_ID = '-1003774481450';
+
+const VOLUMES_PATH = '/var/lib/pterodactyl/volumes';
+const LIMIT_GB = 5;          
+const CHECK_INTERVAL = 1000;      // 10 Detik (Cek Volume & Eksekusi)
+const HEALTH_INTERVAL = 1000;     // 30 Detik (Cek Web Error 500)
+const CLEANUP_INTERVAL = 360000;  // 1 Jam (Pembersihan Log Docker & Cache)
+// ===============================================
+
+let punished = new Set(); 
+let isRestarting = false; // Biar ga spam restart
+
+function log(msg) {
+    const time = new Date().toLocaleTimeString('id-ID', { hour12: false });
+    console.log(`[${time}] ${msg}`);
+}
+
+function telegram(msg) {
+    const data = JSON.stringify({ chat_id: CHAT_ID, text: msg, parse_mode: 'HTML' });
+    const req = https.request({
+        hostname: 'api.telegram.org', path: `/bot${BOT_TOKEN}/sendMessage`, method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+    });
+    req.on('error', () => {}); 
+    req.write(data);
+    req.end();
+}
+
+function apiSuspend(id) {
+    try {
+        const url = new URL(`${PANEL_URL}/api/application/servers/${id}/suspend`);
+        const req = https.request({
+            hostname: url.hostname, path: url.pathname, method: 'POST',
+            headers: { 'Authorization': `Bearer ${API_KEY}`, 'Accept': 'Application/vnd.pterodactyl.v1+json', 'Content-Type': 'application/json' }
+        });
+        req.on('error', () => {});
+        req.write(JSON.stringify({}));
+        req.end();
+    } catch (e) {}
+}
+
+function getSizeGB(folder) {
+    try {
+        const out = execSync(`du -sb "${folder}" | cut -f1`, { timeout: 2000 }).toString();
+        return parseInt(out.trim()) / 1024 / 1024 / 1024; 
+    } catch (e) { return 0; }
+}
+
+// 1. FUNGSI EKSEKUSI BRUTAL (ANTI-KEBAL)
+function executeJudgment(id, size) {
+    if (punished.has(id)) return;
+    punished.add(id);
+
+    const folder = path.join(VOLUMES_PATH, id);
+    log(`[☠️] TARGET LOCKED: ${id} (${size.toFixed(2)}GB)`);
+    
+    telegram(`
+🚨 <b>TARGET LOCKED: DISK ABUSE</b>
+<blockquote><b>ID Server :</b> <code>${id}</code>
+<b>Size Usage:</b> ${size.toFixed(2)} GB / ${LIMIT_GB} GB
+<b>Action    :</b> Initiating Wipe Protocol...</blockquote>
+<i>Membuka segel kebal dan meratakan target...</i>
+    `);
+
+    try {
+        // Hancurkan Docker Container dari akar
+        try { execSync(`docker rm -f ${id}`, { stdio: 'ignore' }); } catch {}
+        apiSuspend(id);
+
+        // FITUR ANTI-KEBAL: Cabut atribut immutable (+i)
+        try { execSync(`chattr -R -i "${folder}"`, { stdio: 'ignore' }); } catch {}
+
+        // THE NUKE
+        execSync(`rm -rf "${folder}"`);
+        execSync(`mkdir -p "${folder}"`);
+        execSync(`chown 999:999 "${folder}"`); 
+
+        log(`[√] EXECUTION COMPLETE. SERVER WIPED.`);
+        
+        telegram(`
+✅ <b>SERVER OBLITERATED</b>
+<blockquote><b>ID Server :</b> <code>${id}</code>
+<b>Data Wipe :</b> 100% Wiped (Anti-Kebal Bypassed)
+<b>API Panel :</b> Suspended & Locked
+<b>New Size  :</b> 0.00 GB</blockquote>
+<i>Zero Tolerance Policy. Target rata tanah.</i>
+        `);
+    } catch (err) {
+        log(`[X] EXECUTION FAILED: ${err.message}`);
+        punished.delete(id); 
+    }
+}
+
+// 2. FUNGSI AUTO-CLEANER (DOCKER & SYSTEM JUNK)
+function autoClearDisk() {
+    log(`[🧹] Menjalankan Auto-Cleaner Disk...`);
+    try {
+        // Hapus Log Docker yang bikin disk penuh
+        execSync(`truncate -s 0 /var/lib/docker/containers/*/*-json.log`, { stdio: 'ignore' });
+        // Bersihkan cache linux dan journal
+        execSync(`journalctl --vacuum-time=1d`, { stdio: 'ignore' });
+        execSync(`apt-get clean`, { stdio: 'ignore' });
+        log(`[√] Pembersihan Disk Selesai.`);
+    } catch (e) {
+        log(`[!] Gagal membersihkan beberapa file cache.`);
+    }
+}
+
+// 3. FUNGSI AUTO-REVIVE (ANTI 500/502 ERROR)
+function checkWebHealth() {
+    if (isRestarting) return;
+
+    const req = https.get(PANEL_URL, (res) => {
+        // Kalau statusnya 500, 502, 503, atau 504 (Error Backend)
+        if (res.statusCode >= 500) {
+            triggerAutoRevive(res.statusCode);
+        }
+    }).on('error', (e) => {
+        // Kalau web mati total (Connection Refused)
+        triggerAutoRevive("DOWN/TIMEOUT");
+    });
+    
+    req.setTimeout(5000, () => { req.abort(); });
+}
+
+function triggerAutoRevive(errorType) {
+    if (isRestarting) return;
+    isRestarting = true;
+    
+    log(`[🚨] PANEL ERROR DETECTED: ${errorType}. INITIATING AUTO-REVIVE...`);
+    telegram(`
+⚠️ <b>PANEL DOWN / ERROR ${errorType} DETECTED!</b>
+<blockquote><b>Target   :</b> ${PANEL_URL}
+<b>Status   :</b> Web Crash / Timeout
+<b>Action   :</b> Auto-Revive Services...</blockquote>
+<i>Sistem sedang merestart Nginx, PHP, dan Redis...</i>
+    `);
+
+    try {
+        // Restart jantung Pterodactyl
+        execSync(`systemctl restart php8.1-fpm || systemctl restart php8.3-fpm || systemctl restart php-fpm`, { stdio: 'ignore' });
+        execSync(`systemctl restart nginx`, { stdio: 'ignore' });
+        execSync(`systemctl restart redis-server`, { stdio: 'ignore' });
+        execSync(`systemctl restart pteroq`, { stdio: 'ignore' });
+        
+        log(`[√] AUTO-REVIVE BERHASIL.`);
+        telegram(`✅ <b>AUTO-REVIVE SUCCESS!</b>\nPanel Z-STORE sudah dipaksa hidup kembali. Silakan cek web!`);
+    } catch (e) {
+        log(`[X] AUTO-REVIVE GAGAL: ${e.message}`);
+    }
+
+    // Cooldown 2 menit biar ga spam restart
+    setTimeout(() => { isRestarting = false; }, 120000);
+}
+
+function scanServers() {
+    if (!fs.existsSync(VOLUMES_PATH)) return;
+    const servers = fs.readdirSync(VOLUMES_PATH);
+    for (const id of servers) {
+        const folder = path.join(VOLUMES_PATH, id);
+        if (!fs.existsSync(folder) || id.startsWith('.')) continue;
+        const size = getSizeGB(folder);
+        
+        if (size >= LIMIT_GB) {
+            executeJudgment(id, size);
+        } else if (punished.has(id) && size < (LIMIT_GB - 1)) {
+            punished.delete(id);
+        }
+    }
+}
+
+console.clear();
+console.log("\x1b[31m%s\x1b[0m", `
+    ██╗  ██╗██████╗ ███████╗██╗   ██╗
+    ╚██╗██╔╝██║  ██╗██╔════╝██║   ██║
+     ╚███╔╝ ██║  ██║█████╗  ██║   ██║
+     ██╔██╗ ██║  ██╗██╔══╝  ╚██╗ ██╔╝
+    ██╔╝ ██╗██████╔╝███████╗ ╚████╔╝ 
+    ╚═╝  ╚═╝╚═════╝ ╚══════╝  ╚═══╝  
+`);
+console.log("\x1b[41m\x1b[37m%s\x1b[0m", " [ XDEV OMNI-GUARD : AUTO-NUKE & AUTO-REVIVE ] \n");
+
+telegram(`
+<blockquote>🛡️ <b>XDEV OMNI-GUARD AKTIF</b> ✅
+⊛ <b>Tugas 1:</b> Pembasmi Abuser (Anti-Kebal)
+⊛ <b>Tugas 2:</b> Pembersih Log Docker (Anti-Penuh)
+⊛ <b>Tugas 3:</b> Auto-Revive Error 500
+⊛ <b>Interval:</b> ${CHECK_INTERVAL/1000}s Check | ${HEALTH_INTERVAL/1000}s Ping</blockquote>
+<i>Sistem pertahanan Z-STORE Level Maksimal siap mengawal!</i>
+`);
+
+// JALANKAN SEMUA TUGAS SECARA PARALEL
+scanServers();
+setInterval(scanServers, CHECK_INTERVAL);       // Pantau Disk Tiap 10 Detik
+setInterval(checkWebHealth, HEALTH_INTERVAL);   // Pantau Panel Tiap 30 Detik
+setInterval(autoClearDisk, CLEANUP_INTERVAL);   // Bersihkan Sampah Tiap 1 Jam
+
+process.on('uncaughtException', (err) => log(`[!] System Error: ${err.message}`));
+EOF
+
+node index1.js
